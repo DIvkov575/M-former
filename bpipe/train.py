@@ -4,6 +4,7 @@ import torch.nn as nn
 import numpy as np
 from transformer import TransformerModel
 import glob
+from tqdm import tqdm
 
 def load_data(data_dir):
     msas = []
@@ -45,7 +46,8 @@ def train():
     for epoch in range(epochs):
         model.train()
         total_loss = 0
-        for i in range(0, len(data), batch_size):
+        progress_bar = tqdm(range(0, len(data), batch_size), desc=f'Epoch {epoch+1}/{epochs}')
+        for i in progress_bar:
             batch = data[i:i+batch_size]
             # This is a simplified batching, proper batching would require padding
             for seq in batch:
@@ -63,7 +65,7 @@ def train():
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
-        print(f'Epoch {epoch+1}/{epochs}, Loss: {total_loss / len(data)}')
+            progress_bar.set_postfix({'Loss': total_loss / (i + len(batch))})
 
 if __name__ == '__main__':
     train()

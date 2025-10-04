@@ -5,3 +5,4 @@
 boltz/
 data/
 
+*/__pycache__

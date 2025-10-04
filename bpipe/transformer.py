@@ -13,31 +13,25 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
+        pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
+        x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
 
 class TransformerModel(nn.Module):
     def __init__(self, ntoken, ninp, nhead, nhid, nlayers, dropout=0.5):
         super(TransformerModel, self).__init__()
         self.model_type = 'Transformer'
-        self.src_mask = None
         self.pos_encoder = PositionalEncoding(ninp, dropout)
-        encoder_layers = nn.TransformerEncoderLayer(ninp, nhead, nhid, dropout)
+        encoder_layers = nn.TransformerEncoderLayer(ninp, nhead, nhid, dropout, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, nlayers)
         self.encoder = nn.Embedding(ntoken, ninp)
         self.ninp = ninp
         self.decoder = nn.Linear(ninp, ntoken)
 
         self.init_weights()
-
-    def _generate_square_subsequent_mask(self, sz):
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
 
     def init_weights(self):
         initrange = 0.1
@@ -46,13 +40,9 @@ class TransformerModel(nn.Module):
         self.decoder.weight.data.uniform_(-initrange, initrange)
 
     def forward(self, src):
-        if self.src_mask is None or self.src_mask.size(0) != len(src):
-            device = src.device
-            mask = self._generate_square_subsequent_mask(len(src)).to(device)
-            self.src_mask = mask
-
+        src_key_padding_mask = (src == 0)
         src = self.encoder(src) * math.sqrt(self.ninp)
         src = self.pos_encoder(src)
-        output = self.transformer_encoder(src, self.src_mask)
+        output = self.transformer_encoder(src, src_key_padding_mask=src_key_padding_mask)
         output = self.decoder(output)
         return output

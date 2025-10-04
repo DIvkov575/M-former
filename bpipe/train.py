@@ -1,10 +1,11 @@
-
 import torch
 import torch.nn as nn
 import numpy as np
+from torch.utils.data import DataLoader, Dataset
 from transformer import TransformerModel
 import glob
 from tqdm import tqdm
+import torch.nn.utils.rnn as rnn_utils
 
 def load_data(data_dir):
     msas = []
@@ -19,6 +20,19 @@ def load_data(data_dir):
             msas.append(torch.from_numpy(sequence).long())
     return msas
 
+class ProteinDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+def collate_fn(batch):
+    batch = rnn_utils.pad_sequence(batch, batch_first=True, padding_value=0)
+    return batch
 
 def train():
     # Model parameters
@@ -38,34 +52,43 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = TransformerModel(ntokens, ninp, nhead, nhid, nlayers, dropout).to(device)
-    criterion = nn.CrossEntropyLoss()
+    model = torch.compile(model) # PyTorch 2.0+ feature for JIT compilation
+    criterion = nn.CrossEntropyLoss(ignore_index=0) # Ignore padding index
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
     data = load_data('data')
+    dataset = ProteinDataset(data)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
     for epoch in range(epochs):
         model.train()
         total_loss = 0
-        progress_bar = tqdm(range(0, len(data), batch_size), desc=f'Epoch {epoch+1}/{epochs}')
-        for i in progress_bar:
-            batch = data[i:i+batch_size]
-            # This is a simplified batching, proper batching would require padding
-            for seq in batch:
-                seq = seq.to(device)
-                
-                # Create mask
-                mask = torch.rand(seq.shape) < mask_prob
-                masked_seq = seq.clone()
-                masked_seq[mask] = ntokens - 1 # use a special token for masked positions
-                targets = seq.clone()
+        progress_bar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{epochs}')
+        for batch in progress_bar:
+            batch = batch.to(device)
+            
+            # Create mask
+            mask = torch.rand(batch.shape, device=device) < mask_prob
+            # Ensure that we don't mask padding tokens
+            mask = mask & (batch != 0)
+            
+            masked_seq = batch.clone()
+            masked_seq[mask] = ntokens - 1 # use a special token for masked positions
+            targets = batch.clone()
 
-                optimizer.zero_grad()
-                output = model(masked_seq.unsqueeze(1)) # add batch dimension
+            optimizer.zero_grad()
+
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                output = model(masked_seq)
                 loss = criterion(output.view(-1, ntokens), targets.view(-1))
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-            progress_bar.set_postfix({'Loss': total_loss / (i + len(batch))})
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            total_loss += loss.item()
+            progress_bar.set_postfix({'Loss': total_loss / (progress_bar.n + 1)})
 
 if __name__ == '__main__':
     train()

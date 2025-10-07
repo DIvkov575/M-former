@@ -1,9 +1,7 @@
-
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 import numpy as np
 import math
 import os
@@ -129,11 +127,70 @@ def load_msa(npz_path):
         
     return np.array(reconstructed_msa, dtype=np.int32)
 
+from torch.utils.data import Dataset
+
+class StreamMSADataset(Dataset):
+    """
+    A PyTorch Dataset to stream MSA data from a directory of .npz files.
+    """
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.file_list = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.npz')]
+        print(f"Found {len(self.file_list)} files in {data_dir}")
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        npz_path = self.file_list[idx]
+        msa_data = load_msa(npz_path)
+        
+        # Convert to PyTorch tensor
+        msa_tensor = torch.from_numpy(msa_data).long()
+        
+        if msa_tensor.max().item() >= VOCAB_SIZE:
+            raise ValueError(f"Max value in MSA from {npz_path} ({msa_tensor.max().item()}) is >= VOCAB_SIZE ({VOCAB_SIZE}).")
+            
+        return msa_tensor
+
+def collate_fn(batch):
+    """
+    Pads sequences in a batch to the same length.
+    'batch' is a list of tensors, where each tensor is an MSA from a file.
+    """
+    # 21 is the gap token, used for padding
+    gap_token = 21
+    
+    # Find the maximum sequence length in this batch
+    max_len = 0
+    for msa in batch:
+        if msa.shape[1] > max_len:
+            max_len = msa.shape[1]
+            
+    # Pad each MSA to the max_len and stack them
+    padded_batch = []
+    for msa in batch:
+        padding_needed = max_len - msa.shape[1]
+        if padding_needed > 0:
+            # Pad on the right (at the end of the sequence)
+            padding = torch.full((msa.shape[0], padding_needed), gap_token, dtype=msa.dtype)
+            padded_msa = torch.cat([msa, padding], dim=1)
+            padded_batch.append(padded_msa)
+        else:
+            padded_batch.append(msa)
+            
+    # Concatenate all MSAs in the batch along a new dimension (the batch dimension)
+    # This assumes each file contains multiple sequences that are treated as a single unit.
+    # If we want to mix sequences from different files, the logic would be different.
+    # Here, we'll just concatenate them, creating a larger batch.
+    return torch.cat(padded_batch, dim=0)
+
+
 # --- train.py content ---
 # --- Training Setup ---
 # We use a vocab size of 22 to be safe (20 AA + gap + mask)
 VOCAB_SIZE = 23 
-BATCH_SIZE = 64 # Number of sequences per batch
+BATCH_SIZE = 4 # Number of files to load per batch
 
 # Model parameters
 EMBEDDING_DIM = 128
@@ -151,24 +208,18 @@ if __name__ == "__main__":
     print("Starting MSA Transformer training...")
 
     # 1. Load Data
-    print("Loading and processing MSA data from 1a0a_c.npz...")
-    msa_data = load_msa('/Users/dmitriyivkov/programming/bpipe/bpipe/data/1a0a_c.npz')
-    SEQ_LEN = msa_data.shape[1]
-    
-    # Convert to PyTorch tensor
-    msa_tensor = torch.from_numpy(msa_data).long()
-    print(f"[train.py] Max value in msa_tensor: {msa_tensor.max().item()}")
-    if msa_tensor.max().item() >= VOCAB_SIZE:
-        raise ValueError(f"Max value in MSA ({msa_tensor.max().item()}) is >= VOCAB_SIZE ({VOCAB_SIZE}). Adjust VOCAB_SIZE.")
-    
-    # Create a dataset and dataloader
-    dataset = TensorDataset(msa_tensor)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    
-    print(f"Data loaded. MSA shape: {msa_data.shape}")
-    print(f"Sequence length: {SEQ_LEN}")
-    print(f"Number of batches: {len(dataloader)}")
+    data_dir = "/Users/dmitriyivkov/programming/bpipe/bpipe/data/"
+    print(f"Loading data from directory: {data_dir}")
 
+    # Create a streaming dataset and dataloader
+    dataset = StreamMSADataset(data_dir=data_dir)
+    # We use a batch_size of 1 at the DataLoader level because each "item" from the
+    # dataset is a full MSA from a file, which can have many sequences.
+    # The collate_fn will then combine these (potentially variable-length) MSAs.
+    # Let's adjust BATCH_SIZE to mean files per batch.
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    
+    print(f"Data loader created. Number of batches: {len(dataloader)}")
 
     # 2. Model Initialization
     model = MSATransformer(
@@ -194,15 +245,15 @@ if __name__ == "__main__":
     model.train() # Set the model to training mode
     for epoch in range(NUM_EPOCHS):
         total_loss = 0
-        for i, batch in enumerate(dataloader):
-            # batch is a list containing one tensor of shape (BATCH_SIZE, SEQ_LEN)
-            sequences = batch[0].to(device)
+        for i, sequences in enumerate(dataloader):
+            # `sequences` is now a batch of sequences from one or more files,
+            # padded and collated into a single tensor.
+            sequences = sequences.to(device)
             
             # Our model expects input of shape (seq_len, batch_size)
             input_seq = sequences.transpose(0, 1)
             
             # The target is the same as the input.
-            # We are doing masked language modeling implicitly.
             targets = input_seq
 
             optimizer.zero_grad()
@@ -231,21 +282,24 @@ if __name__ == "__main__":
     model.eval() # Set the model to evaluation mode
     with torch.no_grad():
         # Get a single batch for inference
-        sample_batch = next(iter(dataloader))[0].to(device)
-        
-        # Prepare input
-        sample_input = sample_batch.transpose(0, 1)
-        
-        # Get the model's prediction
-        prediction = model(sample_input)
-        
-        # Get the predicted token indices
-        predicted_indices = torch.argmax(prediction, dim=-1)
-        
-        print("\n--- Inference Example ---")
-        print(f"Input shape: {sample_input.shape}")
-        print(f"Prediction shape: {prediction.shape}")
-        print(f"Predicted indices shape: {predicted_indices.shape}")
-        print("Example predicted sequence (first sequence in batch):")
-        print(predicted_indices[:, 0])
+        try:
+            sample_batch = next(iter(dataloader)).to(device)
+            
+            # Prepare input
+            sample_input = sample_batch.transpose(0, 1)
+            
+            # Get the model's prediction
+            prediction = model(sample_input)
+            
+            # Get the predicted token indices
+            predicted_indices = torch.argmax(prediction, dim=-1)
+            
+            print("\n--- Inference Example ---")
+            print(f"Input shape: {sample_input.shape}")
+            print(f"Prediction shape: {prediction.shape}")
+            print(f"Predicted indices shape: {predicted_indices.shape}")
+            print("Example predicted sequence (first sequence in batch):")
+            print(predicted_indices[:, 0])
+        except StopIteration:
+            print("\nCould not get a batch for inference, the dataloader is empty.")
 

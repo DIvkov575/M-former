@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader, TensorDataset, Dataset
 import numpy as np
 import math
 import os
+from torch.cuda.amp import GradScaler, autocast
 
 # --- msa_transformer.py content ---
 class PositionalEncoding(nn.Module):
@@ -139,38 +140,54 @@ class StreamMSADataset(Dataset):
             
         return msa_tensors
 
-def collate_fn(batch):
+def collate_fn(batch, max_tokens_per_batch=4096):
     """
-    Collates a batch of MSAs (from multiple files).
-    'batch' is a list of lists of tensors. Each inner list contains all sequences from one file.
+    Collates a batch of MSAs, creating mini-batches that do not exceed
+    a certain number of tokens (sequences * length).
+    'batch' is a list of lists of tensors.
     """
-    # 21 is the gap token, used for padding
     gap_token = 21
-
-    # Flatten the batch: from list of lists of tensors to a single list of tensors
     all_sequences = [seq for msa_list in batch for seq in msa_list]
+    all_sequences.sort(key=len, reverse=True)
 
-    # Find the maximum sequence length in this batch
-    max_len = 0
-    for seq in all_sequences:
-        if len(seq) > max_len:
-            max_len = len(seq)
+    batches = []
+    current_batch = []
+    current_max_len = 0
 
-    # Pad each sequence to the max_len
-    padded_batch = []
     for seq in all_sequences:
-        padding_needed = max_len - len(seq)
-        if padding_needed > 0:
-            # Pad on the right (at the end of the sequence)
-            padding = torch.full((padding_needed,), gap_token, dtype=seq.dtype)
-            padded_seq = torch.cat([seq, padding], dim=0)
-            padded_batch.append(padded_seq)
+        if not current_batch:
+            current_batch.append(seq)
+            current_max_len = len(seq)
+            continue
+
+        potential_tokens = max(current_max_len, len(seq)) * (len(current_batch) + 1)
+
+        if potential_tokens > max_tokens_per_batch:
+            # Finalize current batch
+            padded_sequences = []
+            for s in current_batch:
+                padding_needed = current_max_len - len(s)
+                padding = torch.full((padding_needed,), gap_token, dtype=s.dtype)
+                padded_sequences.append(torch.cat([s, padding], dim=0))
+            batches.append(torch.stack(padded_sequences, dim=0))
+
+            # Start new batch
+            current_batch = [seq]
+            current_max_len = len(seq)
         else:
-            padded_batch.append(seq)
+            current_batch.append(seq)
+            current_max_len = max(current_max_len, len(seq))
 
-    # Stack all padded sequences into a single tensor for the batch
-    # The output shape will be (total_num_sequences, max_len)
-    return torch.stack(padded_batch, dim=0)
+    if current_batch:
+        # Finalize the last batch
+        padded_sequences = []
+        for s in current_batch:
+            padding_needed = current_max_len - len(s)
+            padding = torch.full((padding_needed,), gap_token, dtype=s.dtype)
+            padded_sequences.append(torch.cat([s, padding], dim=0))
+        batches.append(torch.stack(padded_sequences, dim=0))
+
+    return batches
 
 
 # --- train.py content ---
@@ -193,7 +210,7 @@ LEARNING_RATE = 0.001
 # --- Main Training Loop ---
 if __name__ == "__main__":
     print("Starting MSA Transformer training...")
-    data_dir = "/home/dima/data/boltz/rcsb_processed_msa/"
+    data_dir = "/Users/dmitriyivkov/programming/bpipe/bpipe/data/"
     print(f"Loading data from directory: {data_dir}")
 
     dataset = StreamMSADataset(data_dir=data_dir)
@@ -221,39 +238,41 @@ if __name__ == "__main__":
 
     # 4. Training Loop
     model.train() # Set the model to training mode
+    scaler = GradScaler()
+
     for epoch in range(NUM_EPOCHS):
         total_loss = 0
-        for i, sequences in enumerate(dataloader):
-            torch.cuda.empty_cache()
-            # `sequences` is now a batch of sequences from one or more files,
-            # padded and collated into a single tensor.
-            sequences = sequences.to(device)
-            print(f"  - Batch {i+1}/{len(dataloader)}, Sequences shape: {sequences.shape}")
-            
-            # Our model expects input of shape (seq_len, batch_size)
-            input_seq = sequences.transpose(0, 1)
-            
-            # The target is the same as the input.
-            targets = input_seq
+        num_batches = 0
+        for i, sequence_chunks in enumerate(dataloader):
+            for sequences in sequence_chunks:
+                torch.cuda.empty_cache()
+                sequences = sequences.to(device)
+                print(f"  - File group {i+1}/{len(dataloader)}, Sub-batch shape: {sequences.shape}")
 
-            optimizer.zero_grad()
+                input_seq = sequences.transpose(0, 1)
+                targets = input_seq
 
-            # Forward pass
-            output = model(input_seq)
+                optimizer.zero_grad()
 
-            # Reshape output and targets for loss calculation
-            # Output: (SEQ_LEN * BATCH_SIZE, VOCAB_SIZE)
-            # Targets: (SEQ_LEN * BATCH_SIZE)
-            loss = criterion(output.view(-1, VOCAB_SIZE), targets.reshape(-1))
+                # Use autocast for mixed precision
+                with autocast():
+                    output = model(input_seq)
+                    loss = criterion(output.view(-1, VOCAB_SIZE), targets.reshape(-1))
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5) # Gradient clipping
-            optimizer.step()
+                # Scale loss and backpropagate
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                scaler.step(optimizer)
+                scaler.update()
 
-            total_loss += loss.item()
+                total_loss += loss.item()
+                num_batches += 1
 
-        avg_loss = total_loss / len(dataloader)
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Average Loss: {avg_loss:.4f}")
+        if num_batches > 0:
+            avg_loss = total_loss / num_batches
+            print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Average Loss: {avg_loss:.4f}")
+        else:
+            print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], No data processed.")
 
     print("Training finished.")
 
@@ -262,25 +281,28 @@ if __name__ == "__main__":
     with torch.no_grad():
         # Get a single batch for inference
         try:
-            sample_batch = next(iter(dataloader)).to(device)
-            
-            # Prepare input
-            sample_input = sample_batch.transpose(0, 1)
-            
-            # Get the model's prediction
-            prediction = model(sample_input)
-            
-            # Get the predicted token indices
-            predicted_indices = torch.argmax(prediction, dim=-1)
-            
-            # torch.cuda.empty_cache()
-            
-            print("\n--- Inference Example ---")
-            print(f"Input shape: {sample_input.shape}")
-            print(f"Prediction shape: {prediction.shape}")
-            print(f"Predicted indices shape: {predicted_indices.shape}")
-            print("Example predicted sequence (first sequence in batch):")
-            print(predicted_indices[:, 0])
+            # The dataloader now returns a list of tensors (chunks)
+            sample_chunks = next(iter(dataloader))
+            if sample_chunks:
+                sample_batch = sample_chunks[0].to(device) # Use the first chunk for inference
+                
+                # Prepare input
+                sample_input = sample_batch.transpose(0, 1)
+                
+                # Get the model's prediction
+                prediction = model(sample_input)
+                
+                # Get the predicted token indices
+                predicted_indices = torch.argmax(prediction, dim=-1)
+                
+                print("\n--- Inference Example ---")
+                print(f"Input shape: {sample_input.shape}")
+                print(f"Prediction shape: {prediction.shape}")
+                print(f"Predicted indices shape: {predicted_indices.shape}")
+                print("Example predicted sequence (first sequence in batch):")
+                print(predicted_indices[:, 0])
+            else:
+                print("\nCould not get a batch for inference, the dataloader returned an empty list.")
         except StopIteration:
             print("\nCould not get a batch for inference, the dataloader is empty.")
 

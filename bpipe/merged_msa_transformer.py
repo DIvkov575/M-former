@@ -177,7 +177,7 @@ def collate_fn(batch):
 # --- Training Setup ---
 # We use a vocab size of 22 to be safe (20 AA + gap + mask)
 VOCAB_SIZE = 23 
-BATCH_SIZE = 4 # Number of files to load per batch
+BATCH_SIZE = 1 # Number of files to load per batch
 
 # Model parameters
 EMBEDDING_DIM = 128
@@ -193,17 +193,10 @@ LEARNING_RATE = 0.001
 # --- Main Training Loop ---
 if __name__ == "__main__":
     print("Starting MSA Transformer training...")
-
-    # 1. Load Data
-    data_dir = "/Users/dmitriyivkov/programming/bpipe/bpipe/data/"
+    data_dir = "/home/dima/data/boltz/rcsb_processed_msa/"
     print(f"Loading data from directory: {data_dir}")
 
-    # Create a streaming dataset and dataloader
     dataset = StreamMSADataset(data_dir=data_dir)
-    # We use a batch_size of 1 at the DataLoader level because each "item" from the
-    # dataset is a full MSA from a file, which can have many sequences.
-    # The collate_fn will then combine these (potentially variable-length) MSAs.
-    # Let's adjust BATCH_SIZE to mean files per batch.
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
     
     print(f"Data loader created. Number of batches: {len(dataloader)}")
@@ -218,13 +211,11 @@ if __name__ == "__main__":
         dropout=DROPOUT
     )
 
-    # Check for GPU availability
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     print(f"Training on device: {device}")
 
     # 3. Loss and Optimizer
-    # We use ignore_index so that padding tokens don't contribute to the loss
     criterion = nn.CrossEntropyLoss(ignore_index=21) 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
@@ -233,6 +224,7 @@ if __name__ == "__main__":
     for epoch in range(NUM_EPOCHS):
         total_loss = 0
         for i, sequences in enumerate(dataloader):
+            torch.cuda.empty_cache()
             # `sequences` is now a batch of sequences from one or more files,
             # padded and collated into a single tensor.
             sequences = sequences.to(device)
@@ -254,7 +246,6 @@ if __name__ == "__main__":
             # Targets: (SEQ_LEN * BATCH_SIZE)
             loss = criterion(output.view(-1, VOCAB_SIZE), targets.reshape(-1))
 
-            # Backward pass and optimization
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5) # Gradient clipping
             optimizer.step()
@@ -281,6 +272,8 @@ if __name__ == "__main__":
             
             # Get the predicted token indices
             predicted_indices = torch.argmax(prediction, dim=-1)
+            
+            # torch.cuda.empty_cache()
             
             print("\n--- Inference Example ---")
             print(f"Input shape: {sample_input.shape}")

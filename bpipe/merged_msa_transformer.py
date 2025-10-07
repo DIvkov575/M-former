@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import tqdm
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 import numpy as np
@@ -210,7 +211,7 @@ LEARNING_RATE = 0.001
 # --- Main Training Loop ---
 if __name__ == "__main__":
     print("Starting MSA Transformer training...")
-    data_dir = "/Users/dmitriyivkov/programming/bpipe/bpipe/data/"
+    data_dir = "/home/dima/data/boltz/rcsb_processed_msa/"
     print(f"Loading data from directory: {data_dir}")
 
     dataset = StreamMSADataset(data_dir=data_dir)
@@ -243,11 +244,11 @@ if __name__ == "__main__":
     for epoch in range(NUM_EPOCHS):
         total_loss = 0
         num_batches = 0
-        for i, sequence_chunks in enumerate(dataloader):
+        for i, sequence_chunks in tqdm.tqdm(enumerate(dataloader), total=dataloader.__len__()):
             for sequences in sequence_chunks:
                 torch.cuda.empty_cache()
                 sequences = sequences.to(device)
-                print(f"  - File group {i+1}/{len(dataloader)}, Sub-batch shape: {sequences.shape}")
+                # print(f"  - File group {i+1}/{len(dataloader)}, Sub-batch shape: {sequences.shape}")
 
                 input_seq = sequences.transpose(0, 1)
                 targets = input_seq
@@ -275,6 +276,8 @@ if __name__ == "__main__":
             print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], No data processed.")
 
     print("Training finished.")
+
+    torch.save(model.state_dict(), "model_weights.pth")
 
     # --- Example of how to use the trained model for inference --- 
     model.eval() # Set the model to evaluation mode

@@ -1,11 +1,9 @@
-
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from msa_transformer import MSATransformer
-from data_loader import load_msa
+from data_loader import MSADirectoryLoader
 
 # --- Training Setup ---
 # We use a vocab size of 22 to be safe (20 AA + gap + mask)
@@ -27,25 +25,14 @@ LEARNING_RATE = 0.001
 if __name__ == "__main__":
     print("Starting MSA Transformer training...")
 
-    # 1. Load Data
-    print("Loading and processing MSA data from 1a0a_c.npz...")
-    msa_data = load_msa('/Users/dmitriyivkov/programming/bpipe/bpipe/data/1a0a_c.npz')
-    SEQ_LEN = msa_data.shape[1]
+    # 1. Load Data using the new MSADirectoryLoader
+    data_dir = "/home/dima/data/boltz/rcsb_processed_data/"
+    print(f"Loading and processing MSA data from {data_dir}...")
+    msa_loader = MSADirectoryLoader(data_dir)
     
-    # Convert to PyTorch tensor
-    msa_tensor = torch.from_numpy(msa_data).long()
-    print(f"[train.py] Max value in msa_tensor: {msa_tensor.max().item()}")
-    if msa_tensor.max().item() >= VOCAB_SIZE:
-        raise ValueError(f"Max value in MSA ({msa_tensor.max().item()}) is >= VOCAB_SIZE ({VOCAB_SIZE}). Adjust VOCAB_SIZE.")
-    
-    # Create a dataset and dataloader
-    dataset = TensorDataset(msa_tensor)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    
-    print(f"Data loaded. MSA shape: {msa_data.shape}")
-    print(f"Sequence length: {SEQ_LEN}")
-    print(f"Number of batches: {len(dataloader)}")
-
+    if len(msa_loader) == 0:
+        print("No data found. Exiting.")
+        exit()
 
     # 2. Model Initialization
     model = MSATransformer(
@@ -67,61 +54,81 @@ if __name__ == "__main__":
     criterion = nn.CrossEntropyLoss(ignore_index=21) 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # 4. Training Loop
-    model.train() # Set the model to training mode
+    # 4. Training Loop - now iterates over each MSA from the loader
     for epoch in range(NUM_EPOCHS):
-        total_loss = 0
-        for i, batch in enumerate(dataloader):
-            # batch is a list containing one tensor of shape (BATCH_SIZE, SEQ_LEN)
-            sequences = batch[0].to(device)
+        print(f"\n--- Epoch [{epoch+1}/{NUM_EPOCHS}] ---")
+        total_epoch_loss = 0
+        num_msas_processed = 0
+
+        for i, msa_data in enumerate(msa_loader):
+            if msa_data is None:
+                print(f"Skipping MSA file {i+1}/{len(msa_loader)} due to loading error.")
+                continue
+
+            SEQ_LEN = msa_data.shape[1]
             
-            # Our model expects input of shape (seq_len, batch_size)
-            input_seq = sequences.transpose(0, 1)
+            # Convert to PyTorch tensor
+            msa_tensor = torch.from_numpy(msa_data).long()
+            if msa_tensor.max().item() >= VOCAB_SIZE:
+                print(f"Skipping MSA file {i+1} due to vocab size issue.")
+                continue
             
-            # The target is the same as the input.
-            # We are doing masked language modeling implicitly.
-            targets = input_seq
+            # Create a dataset and dataloader for the current MSA
+            dataset = TensorDataset(msa_tensor)
+            dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+            
+            print(f"Processing MSA {i+1}/{len(msa_loader)} | Shape: {msa_data.shape} | Batches: {len(dataloader)}")
 
-            optimizer.zero_grad()
+            model.train() # Set the model to training mode
+            total_msa_loss = 0
+            for batch in dataloader:
+                sequences = batch[0].to(device)
+                input_seq = sequences.transpose(0, 1)
+                targets = input_seq
 
-            # Forward pass
-            output = model(input_seq)
+                optimizer.zero_grad()
+                output = model(input_seq)
+                loss = criterion(output.view(-1, VOCAB_SIZE), targets.reshape(-1))
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                optimizer.step()
 
-            # Reshape output and targets for loss calculation
-            # Output: (SEQ_LEN * BATCH_SIZE, VOCAB_SIZE)
-            # Targets: (SEQ_LEN * BATCH_SIZE)
-            loss = criterion(output.view(-1, VOCAB_SIZE), targets.reshape(-1))
+                total_msa_loss += loss.item()
+            
+            avg_msa_loss = total_msa_loss / len(dataloader)
+            print(f"MSA {i+1} Average Loss: {avg_msa_loss:.4f}")
+            total_epoch_loss += avg_msa_loss
+            num_msas_processed += 1
 
-            # Backward pass and optimization
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5) # Gradient clipping
-            optimizer.step()
+        avg_epoch_loss = total_epoch_loss / num_msas_processed if num_msas_processed > 0 else 0
+        print(f"\nEpoch [{epoch+1}/{NUM_EPOCHS}] Average Epoch Loss: {avg_epoch_loss:.4f}")
 
-            total_loss += loss.item()
-
-        avg_loss = total_loss / len(dataloader)
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Average Loss: {avg_loss:.4f}")
-
-    print("Training finished.")
+    print("\nTraining finished.")
 
     # --- Example of how to use the trained model for inference ---
+    print("\n--- Running Inference Example ---")
     model.eval() # Set the model to evaluation mode
     with torch.no_grad():
-        # Get a single batch for inference
-        sample_batch = next(iter(dataloader))[0].to(device)
-        
-        # Prepare input
-        sample_input = sample_batch.transpose(0, 1)
-        
-        # Get the model's prediction
-        prediction = model(sample_input)
-        
-        # Get the predicted token indices
-        predicted_indices = torch.argmax(prediction, dim=-1)
-        
-        print("\n--- Inference Example ---")
-        print(f"Input shape: {sample_input.shape}")
-        print(f"Prediction shape: {prediction.shape}")
-        print(f"Predicted indices shape: {predicted_indices.shape}")
-        print("Example predicted sequence (first sequence in batch):")
-        print(predicted_indices[:, 0])
+        # Get a single MSA for inference
+        try:
+            first_msa = msa_loader[0]
+            if first_msa is not None:
+                sample_tensor = torch.from_numpy(first_msa).long()
+                sample_dataset = TensorDataset(sample_tensor)
+                sample_dataloader = DataLoader(sample_dataset, batch_size=BATCH_SIZE)
+                
+                sample_batch = next(iter(sample_dataloader))[0].to(device)
+                sample_input = sample_batch.transpose(0, 1)
+                
+                prediction = model(sample_input)
+                predicted_indices = torch.argmax(prediction, dim=-1)
+                
+                print(f"Input shape: {sample_input.shape}")
+                print(f"Prediction shape: {prediction.shape}")
+                print(f"Predicted indices shape: {predicted_indices.shape}")
+                print("Example predicted sequence (first sequence in batch):")
+                print(predicted_indices[:, 0])
+            else:
+                print("Could not load the first MSA for inference example.")
+        except IndexError:
+            print("No data available to run inference example.")

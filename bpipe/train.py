@@ -1,113 +1,127 @@
 
+
 import torch
 import torch.nn as nn
-import numpy as np
-from torch.utils.data import DataLoader, Dataset
-from inter_intra_transformer import InterIntraTransformer
-import glob
-from tqdm import tqdm
-import torch.nn.utils.rnn as rnn_utils
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from msa_transformer import MSATransformer
+from data_loader import load_msa
 
-def load_data(data_dir):
-    msas = []
-    for f in glob.glob(f"{data_dir}/*.npz"):
-        data = np.load(f, allow_pickle=True)
-        sequences_data = data['sequences']
-        residues_data = data['residues']['res_type']
-        
-        msa_sequences = []
-        for seq_info in sequences_data:
-            res_start, res_end = seq_info['res_start'], seq_info['res_end']
-            sequence = residues_data[res_start:res_end]
-            msa_sequences.append(torch.from_numpy(sequence).long())
-        
-        if not msa_sequences:
-            continue
+# --- Training Setup ---
+# We use a vocab size of 22 to be safe (20 AA + gap + mask)
+VOCAB_SIZE = 23 
+BATCH_SIZE = 64 # Number of sequences per batch
 
-        msa = rnn_utils.pad_sequence(msa_sequences, batch_first=True, padding_value=0)
-        msas.append(msa)
-    return msas
+# Model parameters
+EMBEDDING_DIM = 128
+NUM_HEADS = 8
+HIDDEN_DIM = 512
+NUM_LAYERS = 6
+DROPOUT = 0.1
 
-class ProteinMSADataset(Dataset):
-    def __init__(self, data):
-        self.data = data
+# Training parameters
+NUM_EPOCHS = 5
+LEARNING_RATE = 0.001
 
-    def __len__(self):
-        return len(self.data)
+# --- Main Training Loop ---
+if __name__ == "__main__":
+    print("Starting MSA Transformer training...")
 
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-def collate_fn(batch):
-    # batch is a list of MSAs (2D tensors)
-    max_num_seqs = max(msa.shape[0] for msa in batch)
-    max_seq_len = max(msa.shape[1] for msa in batch)
+    # 1. Load Data
+    print("Loading and processing MSA data from 1a0a_c.npz...")
+    msa_data = load_msa('/Users/dmitriyivkov/programming/bpipe/bpipe/data/1a0a_c.npz')
+    SEQ_LEN = msa_data.shape[1]
     
-    padded_batch = torch.zeros(len(batch), max_num_seqs, max_seq_len).long()
+    # Convert to PyTorch tensor
+    msa_tensor = torch.from_numpy(msa_data).long()
+    print(f"[train.py] Max value in msa_tensor: {msa_tensor.max().item()}")
+    if msa_tensor.max().item() >= VOCAB_SIZE:
+        raise ValueError(f"Max value in MSA ({msa_tensor.max().item()}) is >= VOCAB_SIZE ({VOCAB_SIZE}). Adjust VOCAB_SIZE.")
     
-    for i, msa in enumerate(batch):
-        n, s = msa.shape
-        padded_batch[i, :n, :s] = msa
-        
-    return padded_batch
+    # Create a dataset and dataloader
+    dataset = TensorDataset(msa_tensor)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    
+    print(f"Data loaded. MSA shape: {msa_data.shape}")
+    print(f"Sequence length: {SEQ_LEN}")
+    print(f"Number of batches: {len(dataloader)}")
 
-def train():
-    # Model parameters
-    ntokens = 23 # 21 amino acids + 1 gap + 1 mask
-    d_model = 128 # embedding dimension
-    nhead = 4 # number of heads
-    d_ff = 256 # feedforward dimension
-    nlayers = 4 # number of layers
-    dropout = 0.1
 
-    # Training parameters
-    batch_size = 4 # smaller batch size due to larger model and data
-    epochs = 10
-    lr = 0.001
-    mask_prob = 0.15
+    # 2. Model Initialization
+    model = MSATransformer(
+        ntoken=VOCAB_SIZE,
+        ninp=EMBEDDING_DIM,
+        nhead=NUM_HEADS,
+        nhid=HIDDEN_DIM,
+        nlayers=NUM_LAYERS,
+        dropout=DROPOUT
+    )
 
+    # Check for GPU availability
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    print(f"Training on device: {device}")
 
-    model = InterIntraTransformer(ntokens, d_model, nhead, d_ff, nlayers, dropout).to(device)
-    model = torch.compile(model)
-    criterion = nn.CrossEntropyLoss(ignore_index=0) # Ignore padding index
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    # 3. Loss and Optimizer
+    # We use ignore_index so that padding tokens don't contribute to the loss
+    criterion = nn.CrossEntropyLoss(ignore_index=21) 
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    data = load_data('data')
-    dataset = Prot teinMSADataset(data)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-
-    for epoch in range(epochs):
-        model.train()
+    # 4. Training Loop
+    model.train() # Set the model to training mode
+    for epoch in range(NUM_EPOCHS):
         total_loss = 0
-        progress_bar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{epochs}')
-        for batch in progress_bar:
-            batch = batch.to(device)
+        for i, batch in enumerate(dataloader):
+            # batch is a list containing one tensor of shape (BATCH_SIZE, SEQ_LEN)
+            sequences = batch[0].to(device)
             
-            # Create mask for MLM
-            mask = torch.rand(batch.shape, device=device) < mask_prob
-            mask = mask & (batch != 0) # Do not mask padding tokens
+            # Our model expects input of shape (seq_len, batch_size)
+            input_seq = sequences.transpose(0, 1)
             
-            masked_msa = batch.clone()
-            masked_msa[mask] = ntokens - 1 # Use a special token for masked positions
-            targets = batch.clone()
-
-            # Create padding mask for the attention
-            src_key_padding_mask = (masked_msa == 0)
+            # The target is the same as the input.
+            # We are doing masked language modeling implicitly.
+            targets = input_seq
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                output = model(masked_msa, src_key_padding_mask=src_key_padding_mask)
-                loss = criterion(output.view(-1, ntokens), targets.view(-1))
-            
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            
-            total_loss += loss.item()
-            progress_bar.set_postfix({'Loss': total_loss / (progress_bar.n + 1)})
+            # Forward pass
+            output = model(input_seq)
 
-if __name__ == '__main__':
-    train()
+            # Reshape output and targets for loss calculation
+            # Output: (SEQ_LEN * BATCH_SIZE, VOCAB_SIZE)
+            # Targets: (SEQ_LEN * BATCH_SIZE)
+            loss = criterion(output.view(-1, VOCAB_SIZE), targets.reshape(-1))
+
+            # Backward pass and optimization
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5) # Gradient clipping
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Average Loss: {avg_loss:.4f}")
+
+    print("Training finished.")
+
+    # --- Example of how to use the trained model for inference ---
+    model.eval() # Set the model to evaluation mode
+    with torch.no_grad():
+        # Get a single batch for inference
+        sample_batch = next(iter(dataloader))[0].to(device)
+        
+        # Prepare input
+        sample_input = sample_batch.transpose(0, 1)
+        
+        # Get the model's prediction
+        prediction = model(sample_input)
+        
+        # Get the predicted token indices
+        predicted_indices = torch.argmax(prediction, dim=-1)
+        
+        print("\n--- Inference Example ---")
+        print(f"Input shape: {sample_input.shape}")
+        print(f"Prediction shape: {prediction.shape}")
+        print(f"Predicted indices shape: {predicted_indices.shape}")
+        print("Example predicted sequence (first sequence in batch):")
+        print(predicted_indices[:, 0])

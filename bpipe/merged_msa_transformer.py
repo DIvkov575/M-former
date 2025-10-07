@@ -84,22 +84,7 @@ def load_msa(npz_path):
     deletions_data = data['deletions']
 
     reconstructed_msa = []
-    
-    # Determine the length of the longest sequence after deletions are applied.
-    # This is needed to pad all sequences to the same length.
-    max_len = 0
-    for seq_info in sequences_data:
-        seq_len = (seq_info['res_end'] - seq_info['res_start'])
-        
-        dels_slice = deletions_data[seq_info['del_start']:seq_info['del_end']]
-        num_deletions = np.sum(dels_slice['deletion'])
-        
-        total_len = seq_len + num_deletions
-        if total_len > max_len:
-            max_len = total_len
-
-    # 21 is often used as a gap token in protein sequence analysis
-    gap_token = 21 
+    gap_token = 21  # Standard gap token
 
     for seq_info in sequences_data:
         # Extract the base sequence of residues
@@ -109,23 +94,20 @@ def load_msa(npz_path):
         dels_slice = deletions_data[seq_info['del_start']:seq_info['del_end']]
         
         # Apply deletions by inserting gap tokens
-        # We iterate in reverse to avoid messing up indices as we insert.
-        # We also need to sort deletions by res_idx in descending order.
-        sorted_dels = np.sort(dels_slice, order='res_idx')[::-1]
-        
-        for del_info in sorted_dels:
-            res_idx = del_info['res_idx']
-            num_dels = del_info['deletion']
-            for _ in range(num_dels):
-                sequence.insert(res_idx, gap_token)
+        if len(dels_slice) > 0:
+            sorted_dels = np.sort(dels_slice, order='res_idx')[::-1]
+            for del_info in sorted_dels:
+                res_idx = del_info['res_idx']
+                num_dels = del_info['deletion']
+                # Insert gap tokens at the specified residue index
+                for _ in range(num_dels):
+                    # The res_idx is relative to the start of the *un-modified* sequence
+                    sequence.insert(res_idx, gap_token)
 
-        # Pad the sequence to max_len
-        padding_needed = max_len - len(sequence)
-        sequence.extend([gap_token] * padding_needed)
+        reconstructed_msa.append(np.array(sequence, dtype=np.int32))
         
-        reconstructed_msa.append(sequence)
-        
-    return np.array(reconstructed_msa, dtype=np.int32)
+    # Return a list of numpy arrays, not a single padded array
+    return reconstructed_msa
 
 from torch.utils.data import Dataset
 
@@ -143,47 +125,52 @@ class StreamMSADataset(Dataset):
 
     def __getitem__(self, idx):
         npz_path = self.file_list[idx]
-        msa_data = load_msa(npz_path)
+        msa_data = load_msa(npz_path)  # This now returns a list of np.arrays
         
-        # Convert to PyTorch tensor
-        msa_tensor = torch.from_numpy(msa_data).long()
+        # Convert each sequence to a PyTorch tensor
+        msa_tensors = [torch.from_numpy(seq).long() for seq in msa_data]
         
-        if msa_tensor.max().item() >= VOCAB_SIZE:
-            raise ValueError(f"Max value in MSA from {npz_path} ({msa_tensor.max().item()}) is >= VOCAB_SIZE ({VOCAB_SIZE}).")
+        # It's inefficient to check vocab size here, let's move it to collate_fn
+        # or assume the data is clean.
+        # For now, we'll keep it to be safe, but this is a performance consideration.
+        for tensor in msa_tensors:
+            if tensor.max().item() >= VOCAB_SIZE:
+                raise ValueError(f"Max value in MSA from {npz_path} ({tensor.max().item()}) is >= VOCAB_SIZE ({VOCAB_SIZE}).")
             
-        return msa_tensor
+        return msa_tensors
 
 def collate_fn(batch):
     """
-    Pads sequences in a batch to the same length.
-    'batch' is a list of tensors, where each tensor is an MSA from a file.
+    Collates a batch of MSAs (from multiple files).
+    'batch' is a list of lists of tensors. Each inner list contains all sequences from one file.
     """
     # 21 is the gap token, used for padding
     gap_token = 21
-    
+
+    # Flatten the batch: from list of lists of tensors to a single list of tensors
+    all_sequences = [seq for msa_list in batch for seq in msa_list]
+
     # Find the maximum sequence length in this batch
     max_len = 0
-    for msa in batch:
-        if msa.shape[1] > max_len:
-            max_len = msa.shape[1]
-            
-    # Pad each MSA to the max_len and stack them
+    for seq in all_sequences:
+        if len(seq) > max_len:
+            max_len = len(seq)
+
+    # Pad each sequence to the max_len
     padded_batch = []
-    for msa in batch:
-        padding_needed = max_len - msa.shape[1]
+    for seq in all_sequences:
+        padding_needed = max_len - len(seq)
         if padding_needed > 0:
             # Pad on the right (at the end of the sequence)
-            padding = torch.full((msa.shape[0], padding_needed), gap_token, dtype=msa.dtype)
-            padded_msa = torch.cat([msa, padding], dim=1)
-            padded_batch.append(padded_msa)
+            padding = torch.full((padding_needed,), gap_token, dtype=seq.dtype)
+            padded_seq = torch.cat([seq, padding], dim=0)
+            padded_batch.append(padded_seq)
         else:
-            padded_batch.append(msa)
-            
-    # Concatenate all MSAs in the batch along a new dimension (the batch dimension)
-    # This assumes each file contains multiple sequences that are treated as a single unit.
-    # If we want to mix sequences from different files, the logic would be different.
-    # Here, we'll just concatenate them, creating a larger batch.
-    return torch.cat(padded_batch, dim=0)
+            padded_batch.append(seq)
+
+    # Stack all padded sequences into a single tensor for the batch
+    # The output shape will be (total_num_sequences, max_len)
+    return torch.stack(padded_batch, dim=0)
 
 
 # --- train.py content ---
@@ -249,6 +236,7 @@ if __name__ == "__main__":
             # `sequences` is now a batch of sequences from one or more files,
             # padded and collated into a single tensor.
             sequences = sequences.to(device)
+            print(f"  - Batch {i+1}/{len(dataloader)}, Sequences shape: {sequences.shape}")
             
             # Our model expects input of shape (seq_len, batch_size)
             input_seq = sequences.transpose(0, 1)

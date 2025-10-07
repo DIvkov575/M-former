@@ -27,11 +27,11 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 class MSATransformer(nn.Module):
-    def __init__(self, ntoken, ninp, nhead, nhid, nlayers, dropout=0.5):
+    def __init__(self, ntoken, ninp, nhead, nhid, nlayers, dropout=0.5, max_len=5000):
         super(MSATransformer, self).__init__()
         self.model_type = 'Transformer'
         self.src_mask = None
-        self.pos_encoder = PositionalEncoding(ninp, dropout)
+        self.pos_encoder = PositionalEncoding(ninp, dropout, max_len=max_len)
         encoder_layers = nn.TransformerEncoderLayer(ninp, nhead, nhid, dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, nlayers)
         self.encoder = nn.Embedding(ntoken, ninp)
@@ -212,7 +212,7 @@ LEARNING_RATE = 0.001
 # --- Main Training Loop ---
 if __name__ == "__main__":
     print("Starting MSA Transformer training...")
-    data_dir = "/home/dima/data/boltz/rcsb_processed_msa/"
+    data_dir = "/Users/dmitriyivkov/programming/bpipe/bpipe/data/"
     print(f"Loading data from directory: {data_dir}")
 
     dataset = StreamMSADataset(data_dir=data_dir)

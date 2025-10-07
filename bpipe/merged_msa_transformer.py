@@ -203,6 +203,7 @@ NUM_HEADS = 8
 HIDDEN_DIM = 512
 NUM_LAYERS = 6
 DROPOUT = 0.1
+MAX_LEN = 10000
 
 # Training parameters
 NUM_EPOCHS = 5
@@ -226,7 +227,8 @@ if __name__ == "__main__":
         nhead=NUM_HEADS,
         nhid=HIDDEN_DIM,
         nlayers=NUM_LAYERS,
-        dropout=DROPOUT
+        dropout=DROPOUT,
+        max_len=MAX_LEN
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

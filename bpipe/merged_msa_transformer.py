@@ -8,6 +8,8 @@ import math
 import os
 from torch.cuda.amp import GradScaler, autocast
 
+os.makedirs("weights", exist_ok=True)
+
 # --- msa_transformer.py content ---
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
@@ -29,14 +31,19 @@ class PositionalEncoding(nn.Module):
 class MSATransformer(nn.Module):
     def __init__(self, ntoken, ninp, nhead, nhid, nlayers, dropout=0.5, max_len=5000):
         super(MSATransformer, self).__init__()
-        self.model_type = 'Transformer'
         self.src_mask = None
         self.pos_encoder = PositionalEncoding(ninp, dropout, max_len=max_len)
         encoder_layers = nn.TransformerEncoderLayer(ninp, nhead, nhid, dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, nlayers)
         self.encoder = nn.Embedding(ntoken, ninp)
         self.ninp = ninp
-        self.decoder = nn.Linear(ninp, ntoken)
+        
+        self.prediction_head_features = nn.Sequential(
+            nn.Linear(ninp, nhid),
+            nn.GELU(),
+            nn.LayerNorm(nhid)
+        )
+        self.prediction_head_output = nn.Linear(nhid, ntoken)
 
         self.init_weights()
 
@@ -48,10 +55,14 @@ class MSATransformer(nn.Module):
     def init_weights(self):
         initrange = 0.1
         self.encoder.weight.data.uniform_(-initrange, initrange)
-        self.decoder.bias.data.zero_()
-        self.decoder.weight.data.uniform_(-initrange, initrange)
+        for layer in self.prediction_head_features:
+            if isinstance(layer, nn.Linear):
+                layer.bias.data.zero_()
+                layer.weight.data.uniform_(-initrange, initrange)
+        self.prediction_head_output.bias.data.zero_()
+        self.prediction_head_output.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, src):
+    def forward(self, src, return_embed=False):
         if self.src_mask is None or self.src_mask.size(0) != len(src):
             device = src.device
             mask = self._generate_square_subsequent_mask(len(src)).to(device)
@@ -59,8 +70,13 @@ class MSATransformer(nn.Module):
 
         src = self.encoder(src) * math.sqrt(self.ninp)
         src = self.pos_encoder(src)
-        output = self.transformer_encoder(src, self.src_mask)
-        output = self.decoder(output)
+        transformer_embedding = self.transformer_encoder(src, self.src_mask)
+        
+        last_layer_embedding = self.prediction_head_features(transformer_embedding)
+        output = self.prediction_head_output(last_layer_embedding)
+
+        if return_embed:
+            return output, last_layer_embedding
         return output
 
 # --- data_loader.py content ---
@@ -76,7 +92,7 @@ def load_msa(npz_path):
 
     Returns a NumPy array of shape (num_sequences, seq_length).
     """
-    print(f"[data_loader] Attempting to load: {npz_path}")
+    #print(f"[data_loader] Attempting to load: {npz_path}")
     if not os.path.exists(npz_path):
         print(f"[data_loader] File does not exist: {npz_path}")
     data = np.load(npz_path)
@@ -191,7 +207,6 @@ def collate_fn(batch, max_tokens_per_batch=4096):
     return batches
 
 
-# --- train.py content ---
 # --- Training Setup ---
 # We use a vocab size of 22 to be safe (20 AA + gap + mask)
 VOCAB_SIZE = 23 
@@ -211,12 +226,38 @@ LEARNING_RATE = 0.001
 
 # --- Main Training Loop ---
 if __name__ == "__main__":
-    print("Starting MSA Transformer training...")
-    data_dir = "/Users/dmitriyivkov/programming/bpipe/bpipe/data/"
+
+    # allow drop-in repl
+    import signal, sys, code, threading
+    def _open_repl(frame):
+        # Use a new thread so REPL uses a fresh stdin/out (non-blocking other threads)
+        def repl():
+            # expose both globals and locals from where signal fired
+            namespace = frame.f_globals.copy()
+            namespace.update(frame.f_locals)
+            banner = "Debug REPL (signal). Namespace populated from frame."
+            code.interact(banner=banner, local=namespace)
+        t = threading.Thread(target=repl, daemon=True)
+        t.start()
+    def _handler(signum, frame):
+        # spawn REPL thread
+        _open_repl(frame)
+    signal.signal(signal.SIGUSR1, _handler)
+
+
+
+    # data loadign
+    data_dir = "/home/dima/data/rcsb_processed_msa"
     print(f"Loading data from directory: {data_dir}")
 
     dataset = StreamMSADataset(data_dir=data_dir)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    dataloader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=2
+    )
     
     print(f"Data loader created. Number of batches: {len(dataloader)}")
 
@@ -235,9 +276,25 @@ if __name__ == "__main__":
     model.to(device)
     print(f"Training on device: {device}")
 
+    # Load pre-trained weights
+    model_weights_path = "0_model_weights.pt"
+    if os.path.exists(model_weights_path):
+        print(f"Loading pre-trained weights from {model_weights_path}")
+        model.load_state_dict(torch.load(model_weights_path, map_location=device), strict=False)
+
+        # Freeze all parameters
+        for param in model.parameters():
+            param.requires_grad = False
+
+        # Unfreeze the prediction head
+        for param in model.prediction_head.parameters():
+            param.requires_grad = True
+    else:
+        print("No pre-trained weights found, training from scratch.")
+
     # 3. Loss and Optimizer
     criterion = nn.CrossEntropyLoss(ignore_index=21) 
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE)
 
     # 4. Training Loop
     model.train() # Set the model to training mode
@@ -271,6 +328,9 @@ if __name__ == "__main__":
                 total_loss += loss.item()
                 num_batches += 1
 
+
+        torch.save(model.state_dict(), f"weights/1.{epoch}__weights.pt")
+
         if num_batches > 0:
             avg_loss = total_loss / num_batches
             print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Average Loss: {avg_loss:.4f}")
@@ -279,7 +339,6 @@ if __name__ == "__main__":
 
     print("Training finished.")
 
-    torch.save(model.state_dict(), "model_weights.pth")
 
     # --- Example of how to use the trained model for inference --- 
     model.eval() # Set the model to evaluation mode
